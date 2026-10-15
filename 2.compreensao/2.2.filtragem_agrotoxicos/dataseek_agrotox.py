@@ -1,155 +1,183 @@
 """
-Associação das colunas com o alvo HOSPITAL (base já filtrada)
-=============================================================
+Análise dos campos de agente (AGENTE_1, AGENTE_2, AGENTE_3) na base filtrada
+=============================================================================
 
-O que este script faz:
-  1. Carrega a base JÁ FILTRADA (gerada por filtrar_base.py). Os filtros
-     (ex: AGENTE_TOX in {2, 3, 4}) ficam todos em filtrar_base.py — aqui não
-     se filtra nada, então novos filtros não exigem mexer neste script.
-  2. Gera o perfil das demais colunas JÁ NA BASE FILTRADA (tipo, % de nulos,
-     distribuição por coluna e alertas de qualidade) em um Excel próprio.
-     Este script é autossuficiente: não depende de nenhum outro arquivo.
-  3. Prepara o alvo binário a partir de HOSPITAL (1 -> 1, 2 -> 0; demais
-     códigos, como "ignorado", e nulos ficam de fora da análise de alvo).
-  4. Mede a associação de cada coluna com o alvo e exporta um relatório
-     Excel com:
-        - Resumo               : funil de linhas, distribuição do filtro e do alvo
-        - Ranking Associacao   : V de Cramér, informação mútua, alertas de vazamento
-        - Taxa por Categoria   : taxa de hospitalização por valor, nas melhores colunas
-        - Redundancia          : associação ENTRE as melhores colunas (evita duplicadas)
+Contexto
+--------
+AGENTE_TOX é um CÓDIGO (grupo do agente: 02, 03, 04...). AGENTE_1/2/3 são
+TEXTO LIVRE digitado na notificação (nome comercial/popular de até 3 produtos).
+São campos diferentes: filtrar AGENTE_TOX não restringe o que aparece em
+AGENTE_1/2/3 — por isso lá surgem outros produtos (coexposição, erro de
+classificação, texto "ignorado", grafias diferentes do mesmo produto).
 
-Por que não usar correlação de Pearson em tudo?
-  Quase todas as colunas do SINAN/DATASUS são CÓDIGOS categóricos (1, 2, 9...).
-  Pearson sobre códigos assume uma ordem/escala que não existe (9 = "ignorado"
-  não é "maior" que 1). Por isso a medida principal é o V de Cramér (0 a 1),
-  complementada pela informação mútua. Para colunas numéricas contínuas, também
-  é reportada a correlação ponto-bisserial (Pearson com alvo binário).
+O que este script faz
+---------------------
+  1. Normaliza o texto (maiúsculas, sem acento, sem pontuação).
+  2. Classifica cada agente em um GRUPO (glifosato, inseticida, medicamento,
+     produto domiciliar, ignorado...) por dicionário de palavras-chave.
+  3. AUDITORIA do filtro: cruza AGENTE_TOX x grupo de AGENTE_1, e mostra quantos
+     casos têm agente aparentemente não-praguicida ou coexposição.
+  3b. DISTRIBUIÇÃO POR TIPO DE USO: para CADA valor de AGENTE_TOX (2, 3, 4...),
+     mostra como se comportam AGENTE_1, AGENTE_2 e AGENTE_3 — nomes mais
+     frequentes e grupos — para comparar o que aparece em uso agrícola x
+     doméstico x saúde pública.
+  4. Cria variáveis derivadas (nº de agentes, coexposição, grupo do agente 1...)
+     e mede a associação de cada uma com o alvo HOSPITAL (V de Cramér, informação
+     mútua e taxa de hospitalização por categoria).
+  5. Lista os nomes NÃO classificados mais frequentes, para você ampliar o
+     dicionário (GRUPOS abaixo) — ele é só um ponto de partida.
 
 Pré-requisitos:
     pip install pandas numpy scikit-learn openpyxl
+
+Entrada: dados_csv/base_filtrada.csv (saída do filtrar_base.py)
+Saída:   relatorios/analise_agentes.xlsx + resumo no console (por AGENTE_TOX)
 """
 
+import re
+import unicodedata
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 from sklearn.metrics import mutual_info_score
-
 
 # ----------------------------------------------------------------------
 # CONFIGURAÇÃO
 # ----------------------------------------------------------------------
-CAMINHO_CSV = Path("dados_csv/base_filtrada.csv")   # saída do filtrar_base.py
+CAMINHO_CSV = Path("dados_csv/base_filtrada.csv")
 PASTA_SAIDA = Path("relatorios")
 
+COLUNAS_AGENTE = ["AGENTE_1", "AGENTE_2", "AGENTE_3"]
+COLUNA_GRUPO_TOX = "AGENTE_TOX"
 COLUNA_ALVO = "HOSPITAL"
-VALORES_ALVO_POSITIVO = [1]    # confirme no dicionário de dados do seu sistema
-VALORES_ALVO_NEGATIVO = [2]    # outros códigos (ex: 9 = ignorado) saem da análise
+VALORES_ALVO_POSITIVO = [1]   # confirme no dicionário de dados
+VALORES_ALVO_NEGATIVO = [2]   # outros códigos (ex: 9 = ignorado) saem da parte de associação
 
-MAX_CATEGORIAS = 30        # acima disso, o excedente é agrupado em "OUTROS"
-LIMITE_NUMERICA = 15       # numérica com mais valores distintos que isso = contínua
-BINS_NUMERICAS = 10        # nº de faixas (quantis) para discretizar numéricas
-TOP_N_COLUNAS = 15         # quantas colunas entram em "Taxa por Categoria"
-TOP_N_REDUNDANCIA = 20     # quantas colunas entram na matriz de redundância
+TOP_NAO_CLASSIFICADOS = 60    # quantos nomes não classificados listar por coluna
+TOP_NOMES_POR_TOX = 15        # quantos nomes mostrar por (AGENTE_TOX x AGENTE_n)
 
-# Colunas numéricas que são códigos (tratadas como categóricas, não como quantidades)
-PREFIXOS_CODIGO = ("ID_", "CO_", "COD", "SG_UF", "UF_", "CNES", "CEP")
-TRECHOS_CODIGO = ("MUN", "OCUPA")
-
-LIMITE_VAZAMENTO = 0.50          # V acima disso (com o alvo ou com a nulidade) = suspeita
-LIMITE_ESPARSA = 90.0            # % de nulos acima disso = coluna muito esparsa
-
-# Campos que, pela natureza, costumam ser preenchidos DEPOIS (ou por causa) da
-# internação. Lista inicial: confirme no dicionário de dados e ajuste.
-POSSIVEL_VAZAMENTO = {
-    "DTINTERNA", "UF_HOSP", "MUN_HOSP", "EVOLUCAO",
-    "DT_OBITO", "DT_ENCERRA", "CLASSI_FIN", "CRITERIO",
+# Rótulos do campo AGENTE_TOX (só para deixar os títulos legíveis)
+ROTULOS_TOX = {
+    "1": "Medicamento", "2": "Agrotóxico/uso agrícola", "3": "Agrotóxico/uso doméstico",
+    "4": "Agrotóxico/uso saúde pública", "5": "Raticida", "6": "Produto veterinário",
+    "7": "Produto de uso domiciliar", "8": "Cosmético/higiene pessoal",
+    "9": "Produto químico de uso industrial", "10": "Metal", "11": "Drogas de abuso",
+    "12": "Planta tóxica", "13": "Alimento e bebida", "14": "Outro", "99": "Ignorado",
 }
 
+# Dicionário de classificação: (nome do grupo, regex sobre o texto JÁ normalizado).
+# A ORDEM IMPORTA: vale a primeira regra que casar. É um ponto de partida —
+# amplie com os nomes da aba "Nao Classificados" e, para nomes comerciais,
+# consulte fontes oficiais (ex: AGROFIT/MAPA, monografias da Anvisa).
+GRUPOS = [
+    ("Chumbinho (raticida clandestino)", r"CHUMBINHO"),
+    ("Glifosato", r"GLIFOS|GLYPHOS|ROUNDUP|RANDAP"),
+    ("Herbicida (outros)", r"HERBICIDA|TORDON|PARAQUAT|GRAMOXONE|\b2 4 D\b|ATRAZINA|METSULFUR|CLETODIM|DIURON|PICLORAM|GLUFOSINATO"),
+    ("Inseticida", r"INSETICIDA|CIPERMETRINA|PERMETRINA|DELTAMETRINA|FENDONA|ACEFATO|CLORPIRIFOS|MALATION|FIPRONIL|IMIDACLOPRID|ORGANOFOSFORAD|CARBAMATO"),
+    ("Fungicida", r"FUNGICIDA|MANCOZEB|TEBUCONAZOL|AZOXISTROBINA"),
+    ("Raticida (outros)", r"RATICIDA|VENENO DE RATO|RATOX"),
+    ("Agrotoxico (generico)", r"AGROTOXICO|DEFENSIVO|VENENO"),
+    ("Medicamento", r"CLONAZEPAM|ALPRAZOLAM|DIAZEPAM|FLUOXETINA|AMITRIPTILINA|PARACETAMOL|DIPIRONA|CARBAMAZEPINA|RIVOTRIL|MEDICAMENTO|REMEDIO"),
+    ("Alcool/bebida", r"BEBIDA ALCOOLICA|ALCOOL|CERVEJA|CACHACA|VODKA|PINGA"),   # "ALCOOL" pode ser álcool de limpeza: revisar
+    ("Droga de abuso", r"COCAINA|CRACK|MACONHA|MERLA|DROGA"),
+    ("Produto domiciliar/saneante", r"AGUA SANITARIA|HIPOCLORITO|NAFTALINA|DESINFETANTE|SODA CAUSTICA|AMONIA|ALVEJANTE|DETERGENTE|CLORO"),
+]
+REGRAS = [(nome, re.compile(rx)) for nome, rx in GRUPOS]
+
+PRAGUICIDAS = {
+    "Chumbinho (raticida clandestino)", "Glifosato", "Herbicida (outros)", "Inseticida",
+    "Fungicida", "Raticida (outros)", "Agrotoxico (generico)",
+}
+NAO_PRAGUICIDAS = {"Medicamento", "Alcool/bebida", "Droga de abuso", "Produto domiciliar/saneante"}
+
+GRUPO_VAZIO = "(vazio)"
+GRUPO_IGNORADO = "IGNORADO/NAO INFORMADO"
+GRUPO_NAO_CLASSIFICADO = "NAO CLASSIFICADO"
+PLACEHOLDERS = re.compile(r"^(IGNORADO|IGN|NAO INFORMADO|NI|NAO SABE|NAO SE APLICA|DESCONHECIDO|SEM INFORMACAO)$")
+
 
 # ----------------------------------------------------------------------
-# 1. CARGA E ALVO
+# 1. NORMALIZAÇÃO E CLASSIFICAÇÃO DO TEXTO
 # ----------------------------------------------------------------------
-def carregar_base(caminho: Path) -> pd.DataFrame:
-    """Lê a base já filtrada (saída do filtrar_base.py)."""
-    if not caminho.exists():
-        raise FileNotFoundError(f"'{caminho}' não existe. Rode antes o filtrar_base.py para gerá-la.")
-    df = pd.read_csv(caminho, sep=";", encoding="latin-1", low_memory=False)
-
-    if COLUNA_ALVO not in df.columns:
-        raise KeyError(f"Coluna alvo '{COLUNA_ALVO}' não encontrada. Colunas disponíveis: {list(df.columns)}")
-    return df
+def normalizar(texto) -> str:
+    """'Água Sanitária!' -> 'AGUA SANITARIA' ; '2,4-D' -> '2 4 D'."""
+    if pd.isna(texto):
+        return ""
+    t = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode().upper()
+    return re.sub(r"[^A-Z0-9]+", " ", t).strip()
 
 
-def preparar_alvo(df: pd.DataFrame):
-    """Retorna (df apenas com linhas de alvo válido, alvo binário 0/1, contagem bruta do alvo)."""
+def classificar(texto_normalizado: str) -> str:
+    if texto_normalizado == "":
+        return GRUPO_VAZIO
+    if PLACEHOLDERS.match(texto_normalizado):
+        return GRUPO_IGNORADO
+    for nome, regra in REGRAS:
+        if regra.search(texto_normalizado):
+            return nome
+    return GRUPO_NAO_CLASSIFICADO
+
+
+def preparar_agentes(df: pd.DataFrame):
+    """Retorna (df de nomes normalizados, df de grupos) com uma coluna por AGENTE_n."""
+    normalizados = pd.DataFrame({c: df[c].map(normalizar) for c in COLUNAS_AGENTE})
+    grupos = normalizados.apply(lambda s: s.map(classificar))
+    return normalizados, grupos
+
+
+def _tipo(grupo: str) -> str:
+    if grupo in PRAGUICIDAS:
+        return "praguicida (provavel)"
+    if grupo in NAO_PRAGUICIDAS:
+        return "nao praguicida"
+    if grupo in (GRUPO_VAZIO, GRUPO_IGNORADO):
+        return "vazio/ignorado"
+    return "nao classificado"
+
+
+# ----------------------------------------------------------------------
+# 2. VARIÁVEIS DERIVADAS
+# ----------------------------------------------------------------------
+def criar_variaveis(grupos: pd.DataFrame) -> pd.DataFrame:
+    """Variáveis categóricas derivadas dos agentes, prontas para medir associação com o alvo."""
+    g1, g2, g3 = (grupos[c] for c in COLUNAS_AGENTE)
+    outros = grupos[COLUNAS_AGENTE[1:]]
+    informado = ~grupos.isin([GRUPO_VAZIO, GRUPO_IGNORADO])
+
+    def sim_nao(mascara):
+        return mascara.map({True: "Sim", False: "Nao"})
+
+    return pd.DataFrame({
+        "ag1_grupo": g1,
+        "ag1_tipo": g1.map(_tipo),
+        "n_agentes_informados": informado.sum(axis=1).astype(str),
+        "coagente_nao_praguicida": sim_nao(outros.isin(NAO_PRAGUICIDAS).any(axis=1)),
+        "coagente_praguicida": sim_nao(outros.isin(PRAGUICIDAS).any(axis=1)),
+        "envolve_chumbinho": sim_nao((grupos == "Chumbinho (raticida clandestino)").any(axis=1)),
+        "envolve_glifosato": sim_nao((grupos == "Glifosato").any(axis=1)),
+        "envolve_medicamento_ou_alcool_ou_droga": sim_nao(
+            grupos.isin({"Medicamento", "Alcool/bebida", "Droga de abuso"}).any(axis=1)),
+    }, index=grupos.index)
+
+
+# ----------------------------------------------------------------------
+# 3. MEDIDAS DE ASSOCIAÇÃO COM O ALVO
+# ----------------------------------------------------------------------
+def preparar_alvo(df: pd.DataFrame) -> pd.Series:
+    """Alvo binário (1/0) apenas nas linhas com HOSPITAL válido; demais ficam NaN."""
     codigo = pd.to_numeric(df[COLUNA_ALVO], errors="coerce")
-    contagem_bruta = codigo.value_counts(dropna=False).sort_index()
-
     alvo = pd.Series(np.nan, index=df.index)
     alvo[codigo.isin(VALORES_ALVO_POSITIVO)] = 1
     alvo[codigo.isin(VALORES_ALVO_NEGATIVO)] = 0
-
-    valido = alvo.notna()
-    return df[valido].copy(), alvo[valido].astype(int), contagem_bruta
+    return alvo
 
 
-# ----------------------------------------------------------------------
-# 2. TRANSFORMAÇÃO DE CADA COLUNA EM CATEGORIAS COMPARÁVEIS
-# ----------------------------------------------------------------------
-def _eh_data(col: str, serie: pd.Series) -> bool:
-    nome = col.upper()
-    return pd.api.types.is_datetime64_any_dtype(serie) or nome.startswith("DT") or nome.startswith("DATA")
-
-
-def _eh_codigo(col: str) -> bool:
-    """Colunas numéricas que na verdade são IDENTIFICADORES/códigos (município, UF, ocupação...).
-    Não faz sentido fatiá-las em faixas de quantil; são tratadas como categóricas."""
-    nome = col.upper()
-    return nome.startswith(PREFIXOS_CODIGO) or any(t in nome for t in TRECHOS_CODIGO)
-
-
-def _agrupar_raras(s: pd.Series) -> pd.Series:
-    """Mantém as MAX_CATEGORIAS mais frequentes (e sempre o 'NA'); o resto vira 'OUTROS'."""
-    top = s.value_counts().head(MAX_CATEGORIAS).index
-    return s.where(s.isin(top) | (s == "NA"), "OUTROS")
-
-
-def preparar_categoria(col: str, serie: pd.Series):
-    """
-    Converte a coluna em uma série de rótulos (string) para medir associação.
-    Nulos viram a categoria 'NA' — em bases administrativas, o "não preenchido"
-    costuma carregar informação e não deve ser descartado.
-
-    Retorna (categorias, ordem_dos_rotulos | None, tipo, corr_pontobiserial | None).
-    """
-    if _eh_data(col, serie):
-        mes = pd.to_datetime(serie, errors="coerce").dt.month.astype("Int64").astype("string")
-        return _agrupar_raras(mes.fillna("NA")).astype(str), None, "data (mês)", None
-
-    if pd.api.types.is_numeric_dtype(serie):
-        if serie.nunique(dropna=True) > LIMITE_NUMERICA and not _eh_codigo(col):
-            faixas = pd.qcut(serie, q=BINS_NUMERICAS, duplicates="drop")
-            ordem = [str(i) for i in faixas.cat.categories] + ["NA"]
-            cat = faixas.astype(object).where(faixas.notna(), "NA").astype(str)
-            return cat, ordem, "numérica (faixas)", None  # corr. calculada fora (precisa do alvo)
-
-        nao_nulo = serie.dropna()
-        if len(nao_nulo) and (nao_nulo % 1 == 0).all():
-            serie = serie.astype("Int64")  # 2.0 -> "2"
-
-    s = serie.astype("string").fillna("NA")
-    return _agrupar_raras(s).astype(str), None, "categórica", None
-
-
-# ----------------------------------------------------------------------
-# 3. MEDIDAS DE ASSOCIAÇÃO
-# ----------------------------------------------------------------------
 def cramers_v(x: pd.Series, y: pd.Series) -> float:
-    """V de Cramér com correção de viés (Bergsma). 0 = sem associação, 1 = associação perfeita."""
+    """V de Cramér com correção de viés. 0 = sem associação, 1 = perfeita."""
     tab = pd.crosstab(x, y)
     if tab.shape[0] < 2 or tab.shape[1] < 2:
         return 0.0
@@ -159,132 +187,173 @@ def cramers_v(x: pd.Series, y: pd.Series) -> float:
     chi2 = ((obs - esperado) ** 2 / esperado).sum()
     r, k = obs.shape
     phi2c = max(0.0, chi2 / n - (k - 1) * (r - 1) / (n - 1))
-    rc = r - (r - 1) ** 2 / (n - 1)
-    kc = k - (k - 1) ** 2 / (n - 1)
+    rc, kc = r - (r - 1) ** 2 / (n - 1), k - (k - 1) ** 2 / (n - 1)
     denom = min(kc - 1, rc - 1)
     return float(np.sqrt(phi2c / denom)) if denom > 0 else 0.0
 
 
 def info_mutua_normalizada(x: pd.Series, y: pd.Series) -> float:
-    """Informação mútua dividida pela entropia do alvo: fração da incerteza do alvo explicada pela coluna."""
     p = y.value_counts(normalize=True).values
     entropia = -(p * np.log(p)).sum()
     return float(mutual_info_score(x, y) / entropia) if entropia > 0 else 0.0
 
 
 def _faixa(v: float) -> str:
-    if v >= 0.20:
-        return "forte"
-    if v >= 0.10:
-        return "moderada"
-    if v >= 0.05:
-        return "fraca"
-    return "baixa"
+    return "forte" if v >= 0.20 else "moderada" if v >= 0.10 else "fraca" if v >= 0.05 else "baixa"
 
 
-def calcular_ranking(df: pd.DataFrame, alvo: pd.Series):
-    """Calcula as medidas para cada coluna (exceto o alvo). Retorna (ranking, cats, ordens)."""
-    linhas, cats, ordens = [], {}, {}
-
-    for col in df.columns:
-        if col == COLUNA_ALVO:
-            continue
-        serie = df[col]
-        cat, ordem, tipo, _ = preparar_categoria(col, serie)
-        cats[col], ordens[col] = cat, ordem
-
-        pct_nulos = serie.isna().mean() * 100
-        v = cramers_v(cat, alvo)
-        mi = info_mutua_normalizada(cat, alvo)
-        v_nulos = cramers_v(serie.isna().astype(int), alvo) if serie.isna().any() else 0.0
-        r_pb = None
-        if tipo == "numérica (faixas)":
-            r_pb = serie.corr(alvo)
-
-        alertas = []
-        n_cat = cat.nunique()
-        if n_cat <= 1:
-            alertas.append("constante no recorte")
-        if pct_nulos > LIMITE_ESPARSA:
-            alertas.append(f"muito esparsa ({pct_nulos:.1f}% nulos)")
-        if serie.nunique(dropna=True) > MAX_CATEGORIAS and tipo == "categórica":
-            alertas.append("alta cardinalidade (agrupada em OUTROS)")
-
-        vazamento = []
-        if col in POSSIVEL_VAZAMENTO:
-            vazamento.append("campo tipicamente pós-desfecho/ligado à internação")
-        if v_nulos >= LIMITE_VAZAMENTO:
-            vazamento.append(f"nulidade quase determina o alvo (V={v_nulos:.2f})")
-        if v >= LIMITE_VAZAMENTO:
-            vazamento.append(f"associação suspeitamente alta (V={v:.2f})")
-
+def ranking_variaveis(feat: pd.DataFrame, alvo: pd.Series) -> pd.DataFrame:
+    linhas = []
+    for col in feat.columns:
+        v = cramers_v(feat[col], alvo)
         linhas.append({
-            "coluna": col,
-            "tipo": tipo,
-            "pct_nulos": round(pct_nulos, 2),
-            "n_categorias": n_cat,
+            "variavel": col,
+            "n_categorias": feat[col].nunique(),
             "cramers_v": round(v, 3),
             "faixa_associacao": _faixa(v),
-            "info_mutua_norm": round(mi, 3),
-            "corr_pontobiserial": None if r_pb is None or pd.isna(r_pb) else round(r_pb, 3),
-            "assoc_nulidade_alvo": round(v_nulos, 3),
-            "suspeita_vazamento": "Sim" if vazamento else "Não",
-            "alertas": "; ".join(vazamento + alertas),
+            "info_mutua_norm": round(info_mutua_normalizada(feat[col], alvo), 3),
         })
-
-    ranking = pd.DataFrame(linhas).sort_values("cramers_v", ascending=False).reset_index(drop=True)
-    return ranking, cats, ordens
+    return pd.DataFrame(linhas).sort_values("cramers_v", ascending=False).reset_index(drop=True)
 
 
-# ----------------------------------------------------------------------
-# 4. TABELAS DE APOIO
-# ----------------------------------------------------------------------
-def tabela_taxa(cat: pd.Series, alvo: pd.Series, ordem=None) -> pd.DataFrame:
-    """Para cada valor da coluna: nº de linhas, % do total e taxa de hospitalização."""
+def tabela_taxa(cat: pd.Series, alvo: pd.Series) -> pd.DataFrame:
+    """Por valor: nº de linhas, % do total e taxa de hospitalização (soma fecha em 100%)."""
     base = pd.DataFrame({"valor": cat.values, "alvo": alvo.values})
     g = base.groupby("valor")["alvo"].agg(n="size", hospitalizados="sum")
     taxa_geral = alvo.mean() * 100
-
     g["pct_do_total"] = g["n"] / g["n"].sum() * 100
     g["taxa_hospitalizacao_pct"] = g["hospitalizados"] / g["n"] * 100
     g["dif_vs_geral_pp"] = g["taxa_hospitalizacao_pct"] - taxa_geral
-
-    if ordem:
-        g = g.reindex([o for o in ordem if o in g.index])
-    else:
-        g = g.sort_values("n", ascending=False)
-
+    g = g.sort_values("n", ascending=False)
     g = g[["n", "pct_do_total", "hospitalizados", "taxa_hospitalizacao_pct", "dif_vs_geral_pp"]].round(2)
     g.loc["TOTAL"] = [g["n"].sum(), 100.0, g["hospitalizados"].sum(), round(taxa_geral, 2), 0.0]
     return g.reset_index().rename(columns={"index": "valor"})
 
 
-def matriz_redundancia(colunas: list, cats: dict) -> pd.DataFrame:
-    """V de Cramér entre pares de colunas candidatas: valores altos = informação repetida."""
-    m = pd.DataFrame(1.0, index=colunas, columns=colunas)
-    for i, a in enumerate(colunas):
-        for b in colunas[i + 1:]:
-            m.loc[a, b] = m.loc[b, a] = round(cramers_v(cats[a], cats[b]), 2)
-    return m
+# ----------------------------------------------------------------------
+# 4. TABELAS DE AUDITORIA
+# ----------------------------------------------------------------------
+def tabela_grupos_por_agente(grupos: pd.DataFrame) -> pd.DataFrame:
+    """Para cada AGENTE_n: nº e % (sobre o TOTAL de linhas, não só as preenchidas) de cada grupo."""
+    n = len(grupos)
+    partes = []
+    for c in COLUNAS_AGENTE:
+        vc = grupos[c].value_counts()
+        partes.append(pd.DataFrame({f"{c}_n": vc, f"{c}_pct_linhas": (vc / n * 100).round(2)}))
+    return pd.concat(partes, axis=1).fillna(0).sort_values(f"{COLUNAS_AGENTE[0]}_n", ascending=False)\
+        .rename_axis("grupo").reset_index()
 
 
-def montar_resumo(df_base, contagem_alvo, df_valido, alvo) -> pd.DataFrame:
-    n_filt, n_valido = len(df_base), len(df_valido)
-    pos, neg = int(alvo.sum()), int((alvo == 0).sum())
-    linhas = [
-        (f"Linhas na base analisada ({CAMINHO_CSV.name})", n_filt, 100.0),
-        (f"Distribuição de {COLUNA_ALVO} na base", None, None),
-    ]
-    for cod, n in contagem_alvo.items():
-        linhas.append((f"   {COLUNA_ALVO} = {cod}", int(n), round(n / n_filt * 100, 2)))
+def tabela_nao_classificados(normalizados: pd.DataFrame, grupos: pd.DataFrame) -> pd.DataFrame:
+    linhas = []
+    n = len(normalizados)
+    for c in COLUNAS_AGENTE:
+        nomes = normalizados.loc[grupos[c] == GRUPO_NAO_CLASSIFICADO, c]
+        for nome, qtd in nomes.value_counts().head(TOP_NAO_CLASSIFICADOS).items():
+            linhas.append({"coluna": c, "nome_normalizado": nome, "n": int(qtd),
+                           "pct_das_linhas": round(qtd / n * 100, 2)})
+    return pd.DataFrame(linhas, columns=["coluna", "nome_normalizado", "n", "pct_das_linhas"])
 
-    linhas += [
-        (f"Linhas com alvo válido (usadas na análise)", n_valido, round(n_valido / n_filt * 100, 2)),
-        (f"   Classe positiva ({COLUNA_ALVO} in {VALORES_ALVO_POSITIVO})", pos, round(pos / n_valido * 100, 2)),
-        (f"   Classe negativa ({COLUNA_ALVO} in {VALORES_ALVO_NEGATIVO})", neg, round(neg / n_valido * 100, 2)),
-        ("Razão negativa:positiva", round(neg / pos, 2) if pos else None, None),
-    ]
-    return pd.DataFrame(linhas, columns=["item", "n", "pct"])
+
+def imprimir_resumo(df: pd.DataFrame, grupos: pd.DataFrame, feat: pd.DataFrame) -> None:
+    n = len(df)
+    pct = lambda x: f"{x / n * 100:.1f}%".replace(".", ",")
+    print("=" * 70)
+    print(f"AUDITORIA DOS AGENTES  ({n:,} linhas na base filtrada)".replace(",", "."))
+    print("=" * 70)
+    for c in COLUNAS_AGENTE:
+        tipos = grupos[c].map(_tipo).value_counts()
+        print(f"\n{c} (% sobre o total de linhas):")
+        for tipo in ("praguicida (provavel)", "nao praguicida", "nao classificado", "vazio/ignorado"):
+            print(f"   {tipo:<24} {pct(tipos.get(tipo, 0))}")
+    print("\nVariáveis derivadas (% de linhas = 'Sim'):")
+    for c in ("coagente_nao_praguicida", "coagente_praguicida", "envolve_chumbinho",
+              "envolve_glifosato", "envolve_medicamento_ou_alcool_ou_droga"):
+        print(f"   {c:<42} {pct((feat[c] == 'Sim').sum())}")
+    print("=" * 70)
+
+
+# ----------------------------------------------------------------------
+# 4b. DISTRIBUIÇÃO DOS AGENTES POR VALOR DE AGENTE_TOX
+# ----------------------------------------------------------------------
+def serie_tox(df: pd.DataFrame) -> pd.Series:
+    """AGENTE_TOX como texto limpo ('2', '3', '4'); nulo vira '<NA>'."""
+    return pd.to_numeric(df[COLUNA_GRUPO_TOX], errors="coerce").astype("Int64").astype(str)
+
+
+def codigos_tox(tox: pd.Series) -> list:
+    return sorted((c for c in tox.unique() if c != "<NA>"), key=int)
+
+
+def _rotulo(cod: str) -> str:
+    return f"{cod} ({ROTULOS_TOX[cod]})" if cod in ROTULOS_TOX else cod
+
+
+def bloco_nomes(nomes_do_codigo: pd.Series, top_k: int = TOP_NOMES_POR_TOX) -> pd.DataFrame:
+    """Nomes normalizados mais frequentes (entre os PREENCHIDOS) + 'Outros nomes' + TOTAL = 100%."""
+    preenchidos = nomes_do_codigo[nomes_do_codigo != ""]
+    n_pre = len(preenchidos)
+    colunas = ["nome", "grupo", "n", "pct_dos_preenchidos"]
+    if n_pre == 0:
+        return pd.DataFrame(columns=colunas)
+
+    top = preenchidos.value_counts().head(top_k)
+    linhas = [{"nome": nome, "grupo": classificar(nome), "n": int(q),
+               "pct_dos_preenchidos": round(q / n_pre * 100, 2)} for nome, q in top.items()]
+    resto = n_pre - int(top.sum())
+    if resto > 0:
+        linhas.append({"nome": "Outros nomes", "grupo": "", "n": resto,
+                       "pct_dos_preenchidos": round(resto / n_pre * 100, 2)})
+    linhas.append({"nome": "TOTAL", "grupo": "", "n": n_pre, "pct_dos_preenchidos": 100.0})
+    return pd.DataFrame(linhas, columns=colunas)
+
+
+def montar_blocos_nomes(normalizados: pd.DataFrame, tox: pd.Series, cod: str) -> list:
+    """Um bloco por AGENTE_n para um valor de AGENTE_TOX. Retorna [(titulo, subtitulo, tabela)]."""
+    mascara = tox == cod
+    n_cod = int(mascara.sum())
+    blocos = []
+    for c in COLUNAS_AGENTE:
+        nomes = normalizados.loc[mascara, c]
+        n_pre = int((nomes != "").sum())
+        pct_pre = f"{n_pre / n_cod * 100:.1f}%" if n_cod else "0%"
+        blocos.append((f"AGENTE_TOX = {_rotulo(cod)} | {c}",
+                       f"linhas do código: {n_cod} | {c} preenchido em {n_pre} ({pct_pre})",
+                       bloco_nomes(nomes)))
+    return blocos
+
+
+def tabela_grupos_por_tox(grupos_col: pd.Series, tox: pd.Series, codigos: list) -> pd.DataFrame:
+    """Grupo x AGENTE_TOX. O % é sobre TODAS as linhas do código (inclui '(vazio)'), então cada coluna soma 100%."""
+    cont = pd.crosstab(grupos_col, tox).reindex(columns=codigos, fill_value=0)
+    pct = cont / cont.sum() * 100
+    out = pd.DataFrame({"grupo": cont.index})
+    for cod in codigos:
+        out[f"n_tox{cod}"] = cont[cod].values
+        out[f"pct_tox{cod}"] = pct[cod].round(2).values
+    out = out.iloc[(-cont.sum(axis=1)).argsort(kind="stable").values].reset_index(drop=True)
+    total = {"grupo": "TOTAL"}
+    for cod in codigos:
+        total[f"n_tox{cod}"], total[f"pct_tox{cod}"] = int(cont[cod].sum()), 100.0
+    return pd.concat([out, pd.DataFrame([total])], ignore_index=True)
+
+
+def imprimir_por_tox(df: pd.DataFrame, normalizados: pd.DataFrame, tox: pd.Series, codigos: list, top: int = 5) -> None:
+    n = len(df)
+    print("=" * 70)
+    print("AGENTES POR TIPO DE USO (valor de AGENTE_TOX)")
+    print("=" * 70)
+    for cod in codigos:
+        mascara = tox == cod
+        n_cod = int(mascara.sum())
+        print(f"\nAGENTE_TOX = {_rotulo(cod)}: {n_cod:,} linhas ({n_cod / n * 100:.1f}% da base)".replace(",", "."))
+        for c in COLUNAS_AGENTE:
+            nomes = normalizados.loc[mascara, c]
+            preenchidos = nomes[nomes != ""]
+            print(f"  {c}: preenchido em {len(preenchidos) / n_cod * 100:.1f}% das linhas")
+            for nome, q in preenchidos.value_counts().head(top).items():
+                print(f"      {nome:<32} {q / len(preenchidos) * 100:5.1f}% dos preenchidos")
+    print("=" * 70)
 
 
 # ----------------------------------------------------------------------
@@ -296,280 +365,139 @@ def _py(v):
 
 def _escrever_taxas(wb, blocos: list) -> None:
     aba = wb.create_sheet("Taxa por Categoria")
-    f_titulo = Font(name="Arial", size=10, bold=True)
-    f_cab = Font(name="Arial", size=10, bold=True, italic=True)
-    f_pad = Font(name="Arial", size=10)
-
     linha = 1
     for titulo, tabela in blocos:
-        aba.cell(row=linha, column=1, value=titulo).font = f_titulo
+        aba.cell(row=linha, column=1, value=titulo).font = Font(name="Arial", size=10, bold=True)
         linha += 1
         for j, nome in enumerate(tabela.columns, start=1):
-            aba.cell(row=linha, column=j, value=nome).font = f_cab
+            aba.cell(row=linha, column=j, value=nome).font = Font(name="Arial", size=10, bold=True, italic=True)
         linha += 1
         for _, reg in tabela.iterrows():
             negrito = reg["valor"] == "TOTAL"
             for j, nome in enumerate(tabela.columns, start=1):
-                c = aba.cell(row=linha, column=j, value=_py(reg[nome]))
-                c.font = Font(name="Arial", size=10, bold=negrito)
+                aba.cell(row=linha, column=j, value=_py(reg[nome])).font = Font(name="Arial", size=10, bold=negrito)
             linha += 1
         linha += 2
-
-    aba.column_dimensions["A"].width = 38
+    aba.column_dimensions["A"].width = 40
     for letra in "BCDEF":
         aba.column_dimensions[letra].width = 22
 
 
-def _formatar(wb) -> None:
-    f_pad, f_cab = Font(name="Arial", size=10), Font(name="Arial", size=10, bold=True)
-
-    for nome in ("Resumo", "Ranking Associacao", "Redundancia"):
+def _formatar(wb, abas: list) -> None:
+    for nome in abas:
         aba = wb[nome]
-        aba.freeze_panes = "B2" if nome == "Redundancia" else "A2"
+        aba.freeze_panes = "A2"
         for linha in aba.iter_rows():
             for c in linha:
-                c.font = f_cab if (c.row == 1 or (nome == "Redundancia" and c.column == 1)) else f_pad
+                c.font = Font(name="Arial", size=10, bold=(c.row == 1))
         for coluna in aba.columns:
             maior = max((len(str(c.value)) for c in coluna if c.value is not None), default=10)
             aba.column_dimensions[coluna[0].column_letter].width = min(maior + 2, 60)
 
-    # escala de cor: quanto mais laranja, maior a associação
-    regra = ColorScaleRule(start_type="num", start_value=0, start_color="FFFFFF",
-                           end_type="num", end_value=1, end_color="F4B183")
 
-    aba = wb["Ranking Associacao"]
-    cab = {c.value: c.column_letter for c in aba[1]}
-    for nome_col in ("cramers_v", "info_mutua_norm", "assoc_nulidade_alvo"):
-        letra = cab[nome_col]
-        aba.conditional_formatting.add(f"{letra}2:{letra}{aba.max_row}", regra)
+def _escrever_blocos_horizontais(wb, nome_aba: str, blocos: list) -> None:
+    """Blocos (titulo, subtitulo, tabela) lado a lado numa mesma aba, para comparar AGENTE_1/2/3."""
+    aba = wb.create_sheet(nome_aba)
+    col0 = 1
+    for titulo, subtitulo, tabela in blocos:
+        aba.cell(row=1, column=col0, value=titulo).font = Font(name="Arial", size=10, bold=True)
+        aba.cell(row=2, column=col0, value=subtitulo).font = Font(name="Arial", size=9, italic=True)
+        for j, nome in enumerate(tabela.columns):
+            aba.cell(row=3, column=col0 + j, value=nome).font = Font(name="Arial", size=10, bold=True, italic=True)
+        for i, (_, reg) in enumerate(tabela.iterrows()):
+            negrito = reg["nome"] == "TOTAL"
+            for j, nome in enumerate(tabela.columns):
+                aba.cell(row=4 + i, column=col0 + j, value=_py(reg[nome])).font = Font(name="Arial", size=10, bold=negrito)
+        for j, largura in enumerate((34, 28, 8, 20)):
+            aba.column_dimensions[get_column_letter(col0 + j)].width = largura
+        aba.column_dimensions[get_column_letter(col0 + len(tabela.columns))].width = 4  # espaço entre blocos
+        col0 += len(tabela.columns) + 1
 
-    aba = wb["Redundancia"]
-    aba.conditional_formatting.add(f"B2:{aba.cell(row=aba.max_row, column=aba.max_column).coordinate}", regra)
+
+def _escrever_blocos_verticais(wb, nome_aba: str, blocos: list) -> None:
+    """Blocos (titulo, tabela) empilhados, com linha em branco entre eles."""
+    aba = wb.create_sheet(nome_aba)
+    linha = 1
+    for titulo, tabela in blocos:
+        aba.cell(row=linha, column=1, value=titulo).font = Font(name="Arial", size=10, bold=True)
+        linha += 1
+        for j, nome in enumerate(tabela.columns, start=1):
+            aba.cell(row=linha, column=j, value=nome).font = Font(name="Arial", size=10, bold=True, italic=True)
+        linha += 1
+        for _, reg in tabela.iterrows():
+            negrito = reg.iloc[0] == "TOTAL"
+            for j, nome in enumerate(tabela.columns, start=1):
+                aba.cell(row=linha, column=j, value=_py(reg[nome])).font = Font(name="Arial", size=10, bold=negrito)
+            linha += 1
+        linha += 2
+    aba.column_dimensions["A"].width = 38
+    for j in range(2, 12):
+        aba.column_dimensions[get_column_letter(j)].width = 14
 
 
-def exportar_relatorio(caminho: Path, resumo, ranking, matriz, blocos) -> None:
+def exportar(caminho: Path, tabelas: dict, blocos: list, extras=(), ordem_abas=()) -> None:
+    """Escreve as tabelas simples, o bloco 'Taxa por Categoria' e as abas extras (funções que recebem o workbook)."""
     with pd.ExcelWriter(caminho, engine="openpyxl") as writer:
-        resumo.to_excel(writer, sheet_name="Resumo", index=False)
-        ranking.to_excel(writer, sheet_name="Ranking Associacao", index=False)
-        matriz.to_excel(writer, sheet_name="Redundancia")
-
+        for nome, tabela in tabelas.items():
+            tabela.to_excel(writer, sheet_name=nome, index=False)
     wb = load_workbook(caminho)
     _escrever_taxas(wb, blocos)
-    _formatar(wb)
+    for escrever in extras:
+        escrever(wb)
+    _formatar(wb, list(tabelas))
+    for pos, nome in enumerate(ordem_abas):   # abas mais importantes primeiro
+        wb.move_sheet(nome, offset=pos - wb.sheetnames.index(nome))
     wb.save(caminho)
 
 
 # ----------------------------------------------------------------------
-# 6. PERFIL DAS COLUNAS DA BASE FILTRADA (Excel)
-# ----------------------------------------------------------------------
-def _classificar_coluna(col: str, serie: pd.Series, max_categorias: int) -> str:
-    """
-    Classifica a coluna em 'data', 'numerica' (contínua) ou 'categorica'.
-
-    Colunas de data (prefixo DT/DATA, convenção comum do DATASUS, ou já
-    tipadas como datetime) são tratadas à parte: top-N de valores não faz
-    sentido para uma data (cada dia tende a ser quase único), então elas
-    não entram na aba de distribuição — só no perfil geral, com data
-    mínima/máxima.
-    """
-    nome = col.upper()
-    if pd.api.types.is_datetime64_any_dtype(serie) or nome.startswith("DT") or nome.startswith("DATA"):
-        return "data"
-    if pd.api.types.is_numeric_dtype(serie) and serie.nunique(dropna=True) > max_categorias:
-        return "numerica"
-    return "categorica"
-
-
-def gerar_relatorio_excel(
-    df: pd.DataFrame,
-    caminho_saida: Path,
-    max_categorias: int = 15,
-    limite_nulos: float = 40.0,
-    limite_constante: float = 99.0,
-) -> None:
-    """
-    Gera uma planilha .xlsx com 3 abas:
-
-      - "Perfil Geral": 1 linha por coluna — tipo, % de nulos, nº de
-        valores únicos, estatísticas (numéricas) ou intervalo de datas
-        (colunas de data).
-      - "Distribuicao de Valores": uma MINI-TABELA POR COLUNA categórica
-        (não uma tabela única com tudo empilhado), com uma linha "Outros
-        valores" cobrindo o restante — a soma de cada tabela sempre
-        fecha em 100%. Colunas de data e numéricas contínuas não entram
-        aqui (não fazem sentido como top-N).
-      - "Alertas de Qualidade": lista só as colunas com algum problema
-        (nulos em excesso, constante, quase constante) — uma linha por
-        coluna, com todos os motivos combinados, para ficar conciso.
-    """
-    linhas_perfil = []
-    distribuicoes: dict[str, pd.DataFrame] = {}
-    linhas_alertas = []
-
-    for col in df.columns:
-        serie = df[col]
-        n_unicos = serie.nunique(dropna=True)
-        pct_nulos = round(serie.isna().mean() * 100, 2)
-        categoria = _classificar_coluna(col, serie, max_categorias)
-
-        registro = {
-            "coluna": col, "tipo": str(serie.dtype), "categoria": categoria,
-            "pct_nulos": pct_nulos, "n_unicos": n_unicos,
-            "media": None, "mediana": None, "desvio_padrao": None, "min": None, "max": None,
-        }
-
-        if categoria == "numerica":
-            registro.update({
-                "media": round(serie.mean(), 2),
-                "mediana": serie.median(),
-                "desvio_padrao": round(serie.std(), 2),
-                "min": serie.min(),
-                "max": serie.max(),
-            })
-        elif categoria == "data":
-            datas = pd.to_datetime(serie, errors="coerce", dayfirst=True)
-            if datas.notna().any():
-                registro["min"] = datas.min().date().isoformat()
-                registro["max"] = datas.max().date().isoformat()
-        else:  # categorica -> monta a mini-tabela de distribuição desta coluna
-            contagem = serie.value_counts(dropna=True, normalize=True).head(max_categorias)
-            tabela = contagem.reset_index()
-            tabela.columns = ["valor", "pct_do_total"]
-            tabela["pct_do_total"] = (tabela["pct_do_total"] * 100).round(2)
-
-            pct_mostrado = tabela["pct_do_total"].sum()
-            if pct_mostrado < 99.99:  # sobra algo fora do top-N -> soma teria que dar 100%
-                outros = pd.DataFrame([{
-                    "valor": "Outros valores",
-                    "pct_do_total": round(100 - pct_mostrado, 2),
-                }])
-                tabela = pd.concat([tabela, outros], ignore_index=True)
-            distribuicoes[col] = tabela
-
-        linhas_perfil.append(registro)
-
-        # Alertas: checagens independentes, combinadas numa única linha por coluna
-        motivos = []
-        if n_unicos <= 1:
-            motivos.append(("Constante", "Apenas um valor distinto"))
-        if pct_nulos > limite_nulos:
-            motivos.append(("Excesso de nulos", f"{pct_nulos}% ausentes"))
-        if n_unicos > 1:
-            freq_top = serie.value_counts(normalize=True, dropna=True).iloc[0] * 100
-            if freq_top > limite_constante:
-                motivos.append(("Quase constante", f"{freq_top:.1f}% dos registros no mesmo valor"))
-        if motivos:
-            linhas_alertas.append({
-                "coluna": col,
-                "alertas": ", ".join(m for m, _ in motivos),
-                "detalhe": " | ".join(d for _, d in motivos),
-            })
-
-    df_perfil = pd.DataFrame(linhas_perfil)
-    df_alertas = pd.DataFrame(linhas_alertas) if linhas_alertas else pd.DataFrame(
-        columns=["coluna", "alertas", "detalhe"])
-
-    with pd.ExcelWriter(caminho_saida, engine="openpyxl") as writer:
-        df_perfil.to_excel(writer, sheet_name="Perfil Geral", index=False)
-        df_alertas.to_excel(writer, sheet_name="Alertas de Qualidade", index=False)
-
-    _escrever_distribuicoes(caminho_saida, distribuicoes)
-    _formatar_planilha(caminho_saida)
-    print(f"[OK] Relatório exportado para: {caminho_saida}")
-    print(f"     {len(distribuicoes)} colunas categóricas com tabela de distribuição.")
-    print(f"     {len(linhas_alertas)} colunas com algum alerta de qualidade.")
-
-
-def _escrever_distribuicoes(caminho: Path, distribuicoes: dict) -> None:
-    """
-    Escreve, na aba 'Distribuicao de Valores', um bloco (tabelinha) por
-    coluna categórica: título da coluna em negrito, cabeçalho, linhas de
-    valor/percentual, e uma linha em branco separando do próximo bloco.
-    """
-    wb = load_workbook(caminho)
-    aba = wb.create_sheet("Distribuicao de Valores")
-
-    fonte_titulo = Font(name="Arial", size=10, bold=True)
-    fonte_cabecalho = Font(name="Arial", size=10, bold=True, italic=True)
-    fonte_padrao = Font(name="Arial", size=10)
-
-    linha_atual = 1
-    for col, tabela in distribuicoes.items():
-        aba.cell(row=linha_atual, column=1, value=f"Coluna: {col}").font = fonte_titulo
-        linha_atual += 1
-
-        aba.cell(row=linha_atual, column=1, value="valor").font = fonte_cabecalho
-        aba.cell(row=linha_atual, column=2, value="pct_do_total").font = fonte_cabecalho
-        linha_atual += 1
-
-        for _, linha in tabela.iterrows():
-            aba.cell(row=linha_atual, column=1, value=linha["valor"]).font = fonte_padrao
-            aba.cell(row=linha_atual, column=2, value=linha["pct_do_total"]).font = fonte_padrao
-            linha_atual += 1
-
-        linha_atual += 2  # linha em branco entre tabelinhas
-
-    aba.column_dimensions["A"].width = 35
-    aba.column_dimensions["B"].width = 15
-    wb.save(caminho)
-
-
-def _formatar_planilha(caminho: Path) -> None:
-    """Formatação básica (fonte Arial, cabeçalho em negrito, largura de
-    coluna, 1ª linha congelada) — aplicada só nas abas 'Perfil Geral' e
-    'Alertas de Qualidade', que têm uma única tabela com cabeçalho na
-    linha 1. A aba 'Distribuicao de Valores' já é formatada na escrita,
-    por ter várias tabelinhas em posições diferentes."""
-    wb = load_workbook(caminho)
-    fonte_padrao = Font(name="Arial", size=10)
-    fonte_cabecalho = Font(name="Arial", size=10, bold=True)
-
-    for nome_aba in ("Perfil Geral", "Alertas de Qualidade"):
-        aba = wb[nome_aba]
-        aba.freeze_panes = "A2"
-        for linha in aba.iter_rows():
-            for celula in linha:
-                celula.font = fonte_cabecalho if celula.row == 1 else fonte_padrao
-
-        for coluna in aba.columns:
-            maior = max((len(str(c.value)) for c in coluna if c.value is not None), default=10)
-            letra = coluna[0].column_letter
-            aba.column_dimensions[letra].width = min(maior + 2, 50)
-
-    wb.save(caminho)
-
-
-# ----------------------------------------------------------------------
-# 7. EXECUÇÃO
+# 6. EXECUÇÃO
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
 
-    df_base = carregar_base(CAMINHO_CSV)
-    print(f"Base analisada: {CAMINHO_CSV} | {len(df_base)} linhas, {df_base.shape[1]} colunas")
+    df = pd.read_csv(CAMINHO_CSV, sep=";", encoding="latin-1", low_memory=False)
+    faltando = [c for c in COLUNAS_AGENTE + [COLUNA_GRUPO_TOX, COLUNA_ALVO] if c not in df.columns]
+    if faltando:
+        raise KeyError(f"Colunas não encontradas: {faltando}")
 
-    # (a) perfil das colunas da base (abas por coluna, alertas etc.)
-    gerar_relatorio_excel(df_base, PASTA_SAIDA / "perfil_base_filtrada.xlsx")
+    normalizados, grupos = preparar_agentes(df)
+    tox = serie_tox(df)
+    codigos = codigos_tox(tox)
 
-    # (b) alvo e associações
-    df_valido, alvo, contagem_alvo = preparar_alvo(df_base)
-    print(f"Linhas com {COLUNA_ALVO} válido: {len(df_valido)} | taxa de positivos: {alvo.mean()*100:.2f}%")
+    feat = criar_variaveis(grupos)
+    feat["AGENTE_TOX"] = tox                                   # o tipo de uso em si, como variável
+    feat["tox_x_ag1_grupo"] = tox + " | " + feat["ag1_grupo"]  # combinação uso x grupo do agente 1
 
-    ranking, cats, ordens = calcular_ranking(df_valido, alvo)
+    imprimir_resumo(df, grupos, feat)
+    imprimir_por_tox(df, normalizados, tox, codigos)
 
-    candidatas = ranking[(ranking["suspeita_vazamento"] == "Não") & (ranking["n_categorias"] > 1)]["coluna"].tolist()
+    # Abas de distribuição por tipo de uso: uma aba por AGENTE_TOX (AGENTE_1/2/3 lado a lado)
+    # e uma aba com a distribuição de GRUPOS (AGENTE_TOX nas colunas) para cada AGENTE_n.
+    blocos_grupos = [(f"{c}: grupo x AGENTE_TOX (% sobre todas as linhas de cada código)",
+                      tabela_grupos_por_tox(grupos[c], tox, codigos)) for c in COLUNAS_AGENTE]
+    extras = [lambda wb, cod=cod: _escrever_blocos_horizontais(
+                  wb, f"Nomes AGENTE_TOX {cod}", montar_blocos_nomes(normalizados, tox, cod))
+              for cod in codigos]
+    extras.append(lambda wb: _escrever_blocos_verticais(wb, "Grupos por AGENTE_TOX", blocos_grupos))
+    ordem_abas = [f"Nomes AGENTE_TOX {cod}" for cod in codigos] + ["Grupos por AGENTE_TOX"]
 
-    blocos = []
-    for col in candidatas[:TOP_N_COLUNAS]:
-        v = ranking.loc[ranking["coluna"] == col, "cramers_v"].iloc[0]
-        blocos.append((f"Coluna: {col}  (V de Cramér = {v})", tabela_taxa(cats[col], alvo, ordens[col])))
+    # Associação com o alvo (somente linhas com HOSPITAL válido)
+    alvo = preparar_alvo(df)
+    valido = alvo.notna()
+    alvo_v, feat_v = alvo[valido].astype(int), feat[valido]
+    ranking = ranking_variaveis(feat_v, alvo_v)
+    blocos = [(f"Variavel: {r.variavel}  (V de Cramer = {r.cramers_v})", tabela_taxa(feat_v[r.variavel], alvo_v))
+              for r in ranking.itertuples()]
 
-    matriz = matriz_redundancia(candidatas[:TOP_N_REDUNDANCIA], cats)
-    resumo = montar_resumo(df_base, contagem_alvo, df_valido, alvo)
-
-    caminho = PASTA_SAIDA / "associacao_com_hospital.xlsx"
-    exportar_relatorio(caminho, resumo, ranking, matriz, blocos)
-
-    print(f"\n[OK] Relatórios salvos em '{PASTA_SAIDA}/'")
-    print("\nTop 15 colunas por associação com o alvo:")
-    print(ranking[["coluna", "cramers_v", "faixa_associacao", "suspeita_vazamento"]].head(15).to_string(index=False))
+    tabelas = {
+        "Grupos por Agente": tabela_grupos_por_agente(grupos),
+        "Associacao HOSPITAL": ranking,
+        "Nao Classificados": tabela_nao_classificados(normalizados, grupos),
+    }
+    caminho = PASTA_SAIDA / "analise_agentes.xlsx"
+    exportar(caminho, tabelas, blocos, extras=extras, ordem_abas=ordem_abas)
+    print(f"\n[OK] Relatório salvo em: {caminho}")
+    print(f"Linhas com {COLUNA_ALVO} válido: {len(alvo_v)} | taxa de positivos: {alvo_v.mean()*100:.2f}%")
+    print("\nAssociação das variáveis derivadas com o alvo:")
+    print(ranking.to_string(index=False))
