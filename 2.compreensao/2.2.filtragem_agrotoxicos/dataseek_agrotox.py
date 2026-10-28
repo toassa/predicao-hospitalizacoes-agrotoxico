@@ -1,39 +1,3 @@
-"""
-Análise dos campos de agente (AGENTE_1, AGENTE_2, AGENTE_3) na base filtrada
-=============================================================================
-
-Contexto
---------
-AGENTE_TOX é um CÓDIGO (grupo do agente: 02, 03, 04...). AGENTE_1/2/3 são
-TEXTO LIVRE digitado na notificação (nome comercial/popular de até 3 produtos).
-São campos diferentes: filtrar AGENTE_TOX não restringe o que aparece em
-AGENTE_1/2/3 — por isso lá surgem outros produtos (coexposição, erro de
-classificação, texto "ignorado", grafias diferentes do mesmo produto).
-
-O que este script faz
----------------------
-  1. Normaliza o texto (maiúsculas, sem acento, sem pontuação).
-  2. Classifica cada agente em um GRUPO (glifosato, inseticida, medicamento,
-     produto domiciliar, ignorado...) por dicionário de palavras-chave.
-  3. AUDITORIA do filtro: cruza AGENTE_TOX x grupo de AGENTE_1, e mostra quantos
-     casos têm agente aparentemente não-praguicida ou coexposição.
-  3b. DISTRIBUIÇÃO POR TIPO DE USO: para CADA valor de AGENTE_TOX (2, 3, 4...),
-     mostra como se comportam AGENTE_1, AGENTE_2 e AGENTE_3 — nomes mais
-     frequentes e grupos — para comparar o que aparece em uso agrícola x
-     doméstico x saúde pública.
-  4. Cria variáveis derivadas (nº de agentes, coexposição, grupo do agente 1...)
-     e mede a associação de cada uma com o alvo HOSPITAL (V de Cramér, informação
-     mútua e taxa de hospitalização por categoria).
-  5. Lista os nomes NÃO classificados mais frequentes, para você ampliar o
-     dicionário (GRUPOS abaixo) — ele é só um ponto de partida.
-
-Pré-requisitos:
-    pip install pandas numpy scikit-learn openpyxl
-
-Entrada: dados_csv/base_filtrada.csv (saída do filtrar_base.py)
-Saída:   relatorios/analise_agentes.xlsx + resumo no console (por AGENTE_TOX)
-"""
-
 import re
 import unicodedata
 from pathlib import Path
