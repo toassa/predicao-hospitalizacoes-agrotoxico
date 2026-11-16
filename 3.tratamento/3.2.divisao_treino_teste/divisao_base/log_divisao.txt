@@ -1,0 +1,52 @@
+=================================================================
+LOG DA DIVISÃO DA BASE DE DADOS
+=================================================================
+Data/hora da execução: 15/11/2026 11:44:15
+Arquivo de entrada: C:\Users\User\Desktop\ic\predicao-hospitalizacoes-agrotoxico\3.tratamento\3.1.ajustar_alvo\base_filtrada\base_sem_nulos_ignorados.csv
+Total de registros originais: 6,338
+Quantidade de colunas: 82
+
+CONFIGURAÇÕES DA DIVISÃO
+-----------------------------------------------------------------
+Método: divisão aleatorizada (shuffle=True)
+Proporção treino: 70%
+Proporção teste: 30%
+Semente aleatória (random_state): 42
+Estratificação: Sim
+Coluna usada na estratificação: HOSPITAL
+
+RESULTADO DA DIVISÃO
+-----------------------------------------------------------------
+Treino: 4,436 registros (69.99%)
+Teste:  1,902 registros (30.01%)
+Total:  6,338 registros
+
+ARQUIVOS GERADOS
+-----------------------------------------------------------------
+Base de treino: C:\Users\User\Desktop\ic\predicao-hospitalizacoes-agrotoxico\3.tratamento\divisao_base\base_treino.csv
+Base de teste:  C:\Users\User\Desktop\ic\predicao-hospitalizacoes-agrotoxico\3.tratamento\divisao_base\base_teste.csv
+
+DISTRIBUIÇÃO DA VARIÁVEL 'HOSPITAL' NA BASE ORIGINAL
+-----------------------------------------------------------------
+  - 2.0: 4,767 registros (75.21%)
+  - 1.0: 1,571 registros (24.79%)
+
+DISTRIBUIÇÃO DA VARIÁVEL 'HOSPITAL' NA BASE DE TREINO
+-----------------------------------------------------------------
+  - 2.0: 3,336 registros (75.20%)
+  - 1.0: 1,100 registros (24.80%)
+
+DISTRIBUIÇÃO DA VARIÁVEL 'HOSPITAL' NA BASE DE TESTE
+-----------------------------------------------------------------
+  - 2.0: 1,431 registros (75.24%)
+  - 1.0: 471 registros (24.76%)
+
+VERIFICAÇÕES
+-----------------------------------------------------------------
+A soma de treino e teste corresponde à base original: Sim
+Registros duplicados na base de treino: 1
+Registros duplicados na base de teste: 0
+
+Observação: a semente aleatória permite reproduzir a mesma divisão,
+desde que a base e as configurações permaneçam iguais.
+=================================================================

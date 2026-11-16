@@ -1,0 +1,41 @@
+=================================================================
+LOG DE FILTRAGEM DA VARIÁVEL HOSPITAL
+=================================================================
+Data/hora: 15/11/2026 11:42:40
+Arquivo original: C:\Users\User\Desktop\ic\predicao-hospitalizacoes-agrotoxico\2.compreensao\2.2.filtragem_agrotoxicos\dados_csv\base_filtrada.csv
+
+RESUMO DA BASE ORIGINAL
+-----------------------------------------------------------------
+Total de registros: 6,738
+Total de colunas: 82
+
+REGISTROS REMOVIDOS
+-----------------------------------------------------------------
+HOSPITAL nulo: 282 (4.19%)
+HOSPITAL = 9 (Ignorado): 118 (1.75%)
+Total removido: 400 (5.94%)
+
+BASE RESULTANTE
+-----------------------------------------------------------------
+Registros restantes: 6,338
+Percentual preservado: 94.06%
+
+DISTRIBUIÇÃO DA VARIÁVEL HOSPITAL
+-----------------------------------------------------------------
+2.0 (Outro valor): 4,767 (75.21%)
+1.0 (Outro valor): 1,571 (24.79%)
+
+VERIFICAÇÕES
+-----------------------------------------------------------------
+Valores nulos restantes em HOSPITAL: 0
+Valores 9 restantes em HOSPITAL: 0
+Colunas preservadas: True
+Valores ausentes nas demais colunas: 185,340
+
+ARQUIVO GERADO
+-----------------------------------------------------------------
+C:\Users\User\Desktop\ic\predicao-hospitalizacoes-agrotoxico\3.tratamento\base_filtrada\base_sem_nulos_ignorados.csv
+
+Observação: nenhuma imputação ou transformação foi realizada.
+Os valores ausentes das demais variáveis foram preservados.
+=================================================================
